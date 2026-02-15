@@ -1,0 +1,251 @@
+Kernel-Level Access Control Experiments on FreeBSD
+1. Overview
+
+This project investigates how access control decisions are enforced by the FreeBSD kernel.
+The goal is not to build an application, but to understand:
+
+How access control decisions are reasoned about in user space
+
+How those decisions are actually enforced by the kernel
+
+How privilege, ACLs, and directory traversal affect access outcomes
+
+To achieve this, the project implements a strict separation between:
+
+Prediction (user-space reasoning without performing access)
+
+Observation (kernel-enforced access after changing identity)
+
+All experiments are performed on a single FreeBSD system using local users only.
+
+2. Programs Included
+accheck
+
+Runs as an unprivileged user
+
+Does NOT attempt access
+
+Predicts whether a specified user should be allowed to perform an operation
+
+Reasons using:
+
+Ownership
+
+Permission bits
+
+ACLs
+
+Directory traversal rules
+
+accheck-helper
+
+Installed as setuid-root
+
+Temporarily assumes the identity of a target user
+
+Attempts the requested operation
+
+Reports the kernel’s actual decision
+
+Drops privileges before performing access
+
+accheck-test-read
+
+Setuid-root test program
+
+Drops privileges to invoking user
+
+Attempts to read a file
+
+accheck-test-write
+
+Setuid-root test program
+
+Drops privileges to invoking user
+
+Attempts to append to a file
+
+accheck-test-exec
+
+Setuid-root test program
+
+Drops privileges to invoking user
+
+Attempts to execute a binary or script
+
+3. Required Environment
+
+FreeBSD 14.x or later
+
+Local user accounts (e.g., alice, bob)
+
+No networking involved
+
+Filesystem may use NFSv4 ACLs (default on ZFS and modern FreeBSD)
+
+4. Build Instructions
+4.1 Prerequisites
+
+Ensure the following are installed:
+
+pkg install gcc make
+
+
+(or use the system clang, which is installed by default)
+
+4.2 Build All Programs
+
+From the project directory:
+
+make clean
+make
+
+
+This builds the following binaries:
+
+accheck
+
+accheck-helper
+
+accheck-test-read
+
+accheck-test-write
+
+accheck-test-exec
+
+5. Installation and setuid Configuration
+5.1 Set Ownership to root
+
+The following programs must be owned by root:
+
+sudo chown root:wheel accheck-helper \
+    accheck-test-read accheck-test-write accheck-test-exec
+
+5.2 Enable setuid Bit
+sudo chmod 4755 accheck-helper \
+    accheck-test-read accheck-test-write accheck-test-exec
+
+5.3 Verify setuid Configuration
+ls -l accheck-helper accheck-test-read accheck-test-write accheck-test-exec
+
+
+Expected output (example):
+
+-rwsr-xr-x  1 root  wheel  accheck-helper
+-rwsr-xr-x  1 root  wheel  accheck-test-read
+-rwsr-xr-x  1 root  wheel  accheck-test-write
+-rwsr-xr-x  1 root  wheel  accheck-test-exec
+
+
+The s in the owner execute field confirms setuid is enabled.
+
+6. User Setup (Example)
+
+Create two local users for experiments:
+
+sudo pw useradd alice -m -s /bin/sh
+sudo pw useradd bob -m -s /bin/sh
+
+sudo passwd alice
+sudo passwd bob
+
+7. Basic Usage
+7.1 Predict Access (Reasoning Only)
+./accheck <user> <read|write|exec> <path>
+
+
+Example:
+
+./accheck bob read /srv/permtest/file.txt
+
+
+This command:
+
+Does not attempt access
+
+Prints a prediction and the reason (e.g., permission bits, ACLs, traversal)
+
+7.2 Validate Kernel Enforcement
+sudo ./accheck-helper <user> <read|write|exec> <path>
+
+
+Example:
+
+sudo ./accheck-helper bob read /srv/permtest/file.txt
+
+
+This command:
+
+Temporarily assumes the identity of bob
+
+Attempts the operation
+
+Reports ALLOW or DENY based solely on the kernel decision
+
+8. setuid Privilege Dropping Tests
+
+These programs demonstrate that privileges do not persist once explicitly dropped.
+
+8.1 Read Test
+sudo -u bob ./accheck-test-read /srv/permtest/file.txt
+
+
+If bob lacks read permission, the kernel denies access even though the binary is setuid-root.
+
+8.2 Write Test
+sudo -u bob ./accheck-test-write /srv/permtest/file.txt
+
+
+Demonstrates enforcement of write permissions after privilege dropping.
+
+8.3 Execute Test
+
+Create a test script:
+
+sudo -u alice sh -c 'printf "#!/bin/sh\necho EXECUTED\n" > /srv/permtest/run.sh'
+sudo chown alice:alice /srv/permtest/run.sh
+sudo chmod 700 /srv/permtest/run.sh
+
+
+Attempt execution as bob:
+
+sudo -u bob ./accheck-test-exec /srv/permtest/run.sh
+
+
+Execution fails unless bob has execute permission.
+
+9. Notes on ACLs
+
+FreeBSD uses NFSv4 ACLs by default
+
+POSIX ACL features such as mask:: are not supported
+
+Equivalent behavior is demonstrated using:
+
+Ordered DENY entries
+
+Precedence of DENY over ALLOW
+
+This difference is documented as part of the assignment’s learning objectives.
+
+10. Key Takeaways
+
+Directory traversal requires execute permission on every directory
+
+ACLs override traditional permission bits
+
+The kernel is the final authority on access decisions
+
+setuid privileges are not retained after explicit privilege dropping
+
+Reasoning and enforcement may differ due to privilege timing
+
+11. Cleanup (Optional)
+sudo rm -rf /srv/permtest
+sudo pw userdel alice -r
+sudo pw userdel bob -r
+
+12. Final Statement
+
+This project demonstrates that accurate access-control reasoning requires understanding kernel behavior, not just metadata.
+Differences between predicted and observed outcomes are intentional and highlight subtle but critical aspects of UNIX security.
