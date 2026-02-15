@@ -1,15 +1,80 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <pwd.h>
 #include <grp.h>
-#include <errno.h>
-#include <string.h>
-#include <fcntl.h>
+#include <unistd.h>
+#include <limits.h>
 
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <user> <read|write|exec> <path>\n", prog);
+static void usage(const char *p) {
+    fprintf(stderr, "Usage: %s <user> <read|write|exec> <path>\n", p);
     exit(1);
+}
+
+/*
+ * Check basic UNIX permission bits
+ * (Used only if ACLs do not grant access)
+ */
+static int check_mode_bits(uid_t uid, gid_t gid, struct stat *st, char op) {
+    if (uid == st->st_uid) {
+        if (op == 'r' && (st->st_mode & S_IRUSR)) return 1;
+        if (op == 'w' && (st->st_mode & S_IWUSR)) return 1;
+        if (op == 'x' && (st->st_mode & S_IXUSR)) return 1;
+    }
+
+    if (gid == st->st_gid) {
+        if (op == 'r' && (st->st_mode & S_IRGRP)) return 1;
+        if (op == 'w' && (st->st_mode & S_IWGRP)) return 1;
+        if (op == 'x' && (st->st_mode & S_IXGRP)) return 1;
+    }
+
+    if (op == 'r' && (st->st_mode & S_IROTH)) return 1;
+    if (op == 'w' && (st->st_mode & S_IWOTH)) return 1;
+    if (op == 'x' && (st->st_mode & S_IXOTH)) return 1;
+
+    return 0;
+}
+
+/*
+ * Very conservative NFSv4 ACL reasoning:
+ * - If any DENY exists for the user → deny
+ * - If an explicit ALLOW exists → allow
+ */
+static int check_nfs4_acl(const char *user, const char *path, char op) {
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof(cmd), "getfacl %s 2>/dev/null", path);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return -1;  // unknown
+
+    char line[512];
+    int allow = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "user:") && strstr(line, user)) {
+            if (strstr(line, ":deny")) {
+                if ((op == 'r' && strchr(line, 'r')) ||
+                    (op == 'w' && strchr(line, 'w')) ||
+                    (op == 'x' && strchr(line, 'x'))) {
+                    pclose(fp);
+                    return 0;  // explicit deny
+                }
+            }
+
+            if (strstr(line, ":allow")) {
+                if ((op == 'r' && strchr(line, 'r')) ||
+                    (op == 'w' && strchr(line, 'w')) ||
+                    (op == 'x' && strchr(line, 'x'))) {
+                    allow = 1;
+                }
+            }
+        }
+    }
+
+    pclose(fp);
+    return allow;
 }
 
 int main(int argc, char *argv[]) {
@@ -17,58 +82,41 @@ int main(int argc, char *argv[]) {
         usage(argv[0]);
 
     const char *user = argv[1];
-    const char *op   = argv[2];
+    const char *opstr = argv[2];
     const char *path = argv[3];
 
-    int mode;
-    if (strcmp(op, "read") == 0)
-        mode = R_OK;
-    else if (strcmp(op, "write") == 0)
-        mode = W_OK;
-    else if (strcmp(op, "exec") == 0)
-        mode = X_OK;
-    else
-        usage(argv[0]);
+    char op;
+    if (!strcmp(opstr, "read")) op = 'r';
+    else if (!strcmp(opstr, "write")) op = 'w';
+    else if (!strcmp(opstr, "exec")) op = 'x';
+    else usage(argv[0]);
 
     struct passwd *pw = getpwnam(user);
     if (!pw) {
-        perror("getpwnam");
+        fprintf(stderr, "Unknown user\n");
         return 1;
     }
 
-    uid_t old_euid = geteuid();
-    gid_t old_egid = getegid();
-
-    /* Switch identity */
-    if (setegid(pw->pw_gid) != 0) {
-        perror("setegid");
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        perror("stat");
         return 1;
     }
 
-    if (initgroups(pw->pw_name, pw->pw_gid) != 0) {
-        perror("initgroups");
-        return 1;
+    int acl = check_nfs4_acl(user, path, op);
+    if (acl == 0) {
+        printf("Prediction: DENY (ACL deny)\n");
+        return 0;
+    }
+    if (acl == 1) {
+        printf("Prediction: ALLOW (ACL allow)\n");
+        return 0;
     }
 
-    if (seteuid(pw->pw_uid) != 0) {
-        perror("seteuid");
-        return 1;
-    }
-
-    /* Ask the kernel (NO ACCESS ATTEMPT) */
-    int ret = faccessat(AT_FDCWD, path, mode, AT_EACCESS);
-
-    /* Restore identity */
-    seteuid(old_euid);
-    setegid(old_egid);
-
-    if (ret == 0) {
-        printf("Prediction: ALLOW\n");
+    if (check_mode_bits(pw->pw_uid, pw->pw_gid, &st, op)) {
+        printf("Prediction: ALLOW (mode bits)\n");
     } else {
-        if (errno == EACCES)
-            printf("Prediction: DENY\n");
-        else
-            perror("faccessat");
+        printf("Prediction: DENY\n");
     }
 
     return 0;
